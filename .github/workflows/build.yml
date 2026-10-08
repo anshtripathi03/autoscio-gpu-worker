@@ -1,13 +1,13 @@
 name: CI
 
 # Every push: lint + tests (no GPU needed — the models are faked).
-# Push to main / a v* tag: also build the Docker image and push it to GHCR as
-#   ghcr.io/<owner>/autoscio-gpu-worker:latest   (main only)
+# Push to main/master / a v* tag: also build the Docker image and push it to GHCR as
+#   ghcr.io/<owner>/autoscio-gpu-worker:latest   (default branch only)
 #   ghcr.io/<owner>/autoscio-gpu-worker:sha-<short>
 #   ghcr.io/<owner>/autoscio-gpu-worker:<version> (v* tags)
 on:
   push:
-    branches: [main]
+    branches: [main, master]
     tags: ["v*"]
   pull_request:
   workflow_dispatch:
