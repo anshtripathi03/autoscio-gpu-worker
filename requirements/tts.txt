@@ -1,0 +1,4 @@
+# Chatterbox Multilingual (MIT). Pinned to a reviewed commit; torch/torchaudio 2.6.0
+# come from the base image via --system-site-packages.
+chatterbox-tts @ git+https://github.com/resemble-ai/chatterbox@5de7a54aa4e5e2baadb0182dde554908b48b85c2
+soundfile

@@ -1,0 +1,132 @@
+name: Deploy Pod
+
+# Manual button: creates a NEW RunPod Pod from a pushed image, then waits until
+# both models are loaded. Use it for first deploys and when the old Pod's GPU is
+# unavailable. Afterwards: put the printed URL into the backend's GPU_WORKER_URL,
+# and terminate the old Pod in the RunPod console so it stops billing.
+#
+# Repo secrets needed (Settings → Secrets and variables → Actions):
+#   RUNPOD_API_KEY   RunPod → Settings → API Keys
+#   WORKER_API_KEY   the same value as the backend's GPU_WORKER_API_KEY
+#   HF_TOKEN         optional
+on:
+  workflow_dispatch:
+    inputs:
+      image_tag:
+        description: "Image tag to deploy (latest, sha-xxxxxxx, 1.2.0)"
+        default: latest
+        required: true
+      gpu_type:
+        description: "GPU"
+        type: choice
+        default: NVIDIA GeForce RTX 4090
+        options:
+          - NVIDIA GeForce RTX 4090
+          - NVIDIA RTX A5000
+          - NVIDIA RTX A6000
+          - NVIDIA L40S
+      cloud:
+        description: "COMMUNITY is cheapest; SECURE is more reliable"
+        type: choice
+        default: COMMUNITY
+        options: [COMMUNITY, SECURE]
+      volume_gb:
+        description: "Persistent /workspace volume for model weights (GB)"
+        default: "80"
+        required: true
+      pod_name:
+        description: "Pod name"
+        default: autoscio-gpu-worker
+        required: true
+      registry_auth_id:
+        description: "RunPod registry credential ID (only if the image is private)"
+        default: ""
+        required: false
+
+permissions:
+  contents: read
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - name: Check secrets
+        env:
+          RUNPOD_API_KEY: ${{ secrets.RUNPOD_API_KEY }}
+          WORKER_API_KEY: ${{ secrets.WORKER_API_KEY }}
+        run: |
+          missing=0
+          [ -n "$RUNPOD_API_KEY" ] || { echo "::error::Add the RUNPOD_API_KEY repo secret"; missing=1; }
+          [ -n "$WORKER_API_KEY" ] || { echo "::error::Add the WORKER_API_KEY repo secret"; missing=1; }
+          exit $missing
+
+      - name: Create Pod
+        id: create
+        env:
+          RUNPOD_API_KEY: ${{ secrets.RUNPOD_API_KEY }}
+          WORKER_API_KEY: ${{ secrets.WORKER_API_KEY }}
+          HF_TOKEN: ${{ secrets.HF_TOKEN }}
+          IMAGE_TAG: ${{ inputs.image_tag }}
+          GPU_TYPE: ${{ inputs.gpu_type }}
+          CLOUD: ${{ inputs.cloud }}
+          VOLUME_GB: ${{ inputs.volume_gb }}
+          POD_NAME: ${{ inputs.pod_name }}
+          REGISTRY_AUTH_ID: ${{ inputs.registry_auth_id }}
+        run: |
+          image="ghcr.io/${GITHUB_REPOSITORY,,}:${IMAGE_TAG}"
+          body=$(jq -n \
+            --arg name "$POD_NAME" --arg image "$image" --arg gpu "$GPU_TYPE" \
+            --arg cloud "$CLOUD" --argjson volume "$VOLUME_GB" \
+            --arg key "$WORKER_API_KEY" --arg hf "$HF_TOKEN" --arg registry "$REGISTRY_AUTH_ID" \
+            '{
+              name: $name,
+              image: $image,
+              gpu: { id: $gpu, count: 1, minCudaVersion: "12.4" },
+              cloud: $cloud,
+              disk: 30,
+              mounts: { persistent: { size: $volume, path: "/workspace" } },
+              ports: ["8000/http"],
+              env: ({ WORKER_API_KEY: $key, MODELS_DIR: "/workspace/models" }
+                    + (if $hf != "" then { HF_TOKEN: $hf } else {} end))
+            } + (if $registry != "" then { registry: $registry } else {} end)')
+
+          status=$(curl -sS -o pod.json -w '%{http_code}' -X POST https://api.runpod.io/v2/pods \
+            -H "Authorization: Bearer $RUNPOD_API_KEY" -H "Content-Type: application/json" \
+            -d "$body")
+          if [ "$status" -ge 300 ]; then
+            echo "::error::RunPod refused the Pod (HTTP $status). If it says no GPUs are available, retry later or pick another GPU type."
+            jq 'del(.env)' pod.json || cat pod.json
+            exit 1
+          fi
+          pod_id=$(jq -r '.id' pod.json)
+          echo "pod_id=$pod_id" >> "$GITHUB_OUTPUT"
+          echo "url=https://${pod_id}-8000.proxy.runpod.net" >> "$GITHUB_OUTPUT"
+          jq '{id, name, status, gpu, cloud, dataCenterId, cost}' pod.json
+
+      - name: Wait for models to load (first boot downloads ~35 GB)
+        env:
+          URL: ${{ steps.create.outputs.url }}
+        run: |
+          for i in $(seq 1 100); do
+            health=$(curl -s --max-time 10 "$URL/health" || true)
+            if echo "$health" | jq -e '.ready == true' >/dev/null 2>&1; then
+              echo "Ready: $health"
+              exit 0
+            fi
+            echo "[$i] not ready yet: ${health:-no response}"
+            sleep 30
+          done
+          echo "::warning::Pod is up but models are not ready after 50 min. Check the Pod logs in RunPod."
+
+      - name: Summary
+        run: |
+          {
+            echo "### Pod deployed"
+            echo "- Pod ID: \`${{ steps.create.outputs.pod_id }}\`"
+            echo "- URL: ${{ steps.create.outputs.url }}"
+            echo ""
+            echo "Next:"
+            echo "1. Set the backend's \`GPU_WORKER_URL=${{ steps.create.outputs.url }}\` and restart it."
+            echo "2. Terminate the OLD Pod in the RunPod console (it keeps billing for storage)."
+          } >> "$GITHUB_STEP_SUMMARY"

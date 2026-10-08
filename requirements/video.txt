@@ -1,0 +1,8 @@
+# LTX-Video (code Apache-2.0; check the weights licence before commercial launch).
+# Pinned to a reviewed commit; torch/torchvision come from the base image.
+ltx-video[inference] @ git+https://github.com/Lightricks/LTX-Video@4b2d053057623ddd4d0a1d3e9cd28890e9ef487f
+# LTX-Video only sets lower bounds and reaches into diffusers internals; pin the
+# versions from its release era so a new diffusers can't silently break it.
+diffusers==0.34.0
+transformers==4.51.3
+pyyaml
