@@ -24,6 +24,9 @@ from .runner_manager import RunnerManager
 from .schemas import OUTPUT_TYPES, PARAMS_MODEL, JobRequest
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
+# httpx logs every request at INFO — the 5-second runner health polls would bury the
+# lines that matter. Runner state changes are logged by RunnerManager instead.
+logging.getLogger("httpx").setLevel(logging.WARNING)
 log = logging.getLogger("worker")
 
 

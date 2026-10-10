@@ -1,12 +1,16 @@
 """LTX-Video runner (text-to-video and image-to-video). Runs inside /opt/venv-video.
 
-Mirrors ltx_video.inference.infer(), with one important difference: infer() builds
-the whole pipeline (several GB of weights) on every call. Here it is built once at
-startup and reused, so a job costs only the generation itself.
+Mirrors ltx_video.inference.infer(), with two differences:
+  * infer() builds the whole pipeline on every call; here it is built once at startup.
+  * ltx_video's create_ltx_video_pipeline() moves the T5-XXL text encoder to the GPU in
+    float32 (~19 GB) and only then casts it to bfloat16 (~9.5 GB). Next to Chatterbox
+    that overflows a 24 GB card, so build_pipeline() below loads T5 in bfloat16 from
+    the start: same weights and same final dtypes, half the peak memory.
 """
 
 from __future__ import annotations
 
+import json
 import os
 import random
 from pathlib import Path
@@ -18,11 +22,16 @@ import yaml
 from huggingface_hub import hf_hub_download
 from ltx_video.inference import (
     create_latent_upsampler,
-    create_ltx_video_pipeline,
+    create_transformer,
     prepare_conditioning,
 )
-from ltx_video.pipelines.pipeline_ltx_video import LTXMultiScalePipeline
+from ltx_video.models.autoencoders.causal_video_autoencoder import CausalVideoAutoencoder
+from ltx_video.models.transformers.symmetric_patchifier import SymmetricPatchifier
+from ltx_video.pipelines.pipeline_ltx_video import LTXMultiScalePipeline, LTXVideoPipeline
+from ltx_video.schedulers.rf import RectifiedFlowScheduler
 from ltx_video.utils.skip_layer_strategy import SkipLayerStrategy
+from safetensors import safe_open
+from transformers import T5EncoderModel, T5Tokenizer
 
 from app.runners.common import (
     ModelRunner,
@@ -50,6 +59,49 @@ STG_MODES = {
 }
 
 
+def build_pipeline(
+    ckpt_path: str,
+    precision: str,
+    text_encoder_name: str,
+    sampler: str | None,
+    device: str,
+) -> LTXVideoPipeline:
+    """create_ltx_video_pipeline() without prompt enhancement, with T5 loaded in bfloat16."""
+    with safe_open(ckpt_path, framework="pt") as f:
+        allowed_inference_steps = json.loads(f.metadata()["config"]).get("allowed_inference_steps")
+
+    vae = CausalVideoAutoencoder.from_pretrained(ckpt_path).to(torch.bfloat16).to(device)
+    transformer = create_transformer(ckpt_path, precision).to(device)
+    if sampler == "from_checkpoint" or not sampler:
+        scheduler = RectifiedFlowScheduler.from_pretrained(ckpt_path)
+    else:
+        scheduler = RectifiedFlowScheduler(
+            sampler="Uniform" if sampler.lower() == "uniform" else "LinearQuadratic"
+        )
+    text_encoder = T5EncoderModel.from_pretrained(
+        text_encoder_name,
+        subfolder="text_encoder",
+        torch_dtype=torch.bfloat16,
+        low_cpu_mem_usage=True,
+    ).to(device)
+    tokenizer = T5Tokenizer.from_pretrained(text_encoder_name, subfolder="tokenizer")
+
+    pipeline = LTXVideoPipeline(
+        transformer=transformer,
+        patchifier=SymmetricPatchifier(patch_size=1),
+        text_encoder=text_encoder,
+        tokenizer=tokenizer,
+        scheduler=scheduler,
+        vae=vae,
+        prompt_enhancer_image_caption_model=None,
+        prompt_enhancer_image_caption_processor=None,
+        prompt_enhancer_llm_model=None,
+        prompt_enhancer_llm_tokenizer=None,
+        allowed_inference_steps=allowed_inference_steps,
+    )
+    return pipeline.to(device)
+
+
 class LtxRunner(ModelRunner):
     name = "video"
 
@@ -64,15 +116,14 @@ class LtxRunner(ModelRunner):
             self.config = yaml.safe_load(fh)
 
         checkpoint = hf_hub_download(LTX_REPO, self.config["checkpoint_path"])
-        pipeline = create_ltx_video_pipeline(
+        # No prompt enhancement: it would load Florence-2 + Llama-3.2-3B (~10 GB more),
+        # and the backend's LLM already writes detailed visual prompts.
+        pipeline = build_pipeline(
             ckpt_path=checkpoint,
             precision=self.config["precision"],
-            text_encoder_model_name_or_path=self.config["text_encoder_model_name_or_path"],
+            text_encoder_name=self.config["text_encoder_model_name_or_path"],
             sampler=self.config.get("sampler"),
             device=self.device,
-            # Prompt enhancement would load Florence-2 + Llama-3.2-3B (~10 GB more).
-            # The backend's LLM already writes detailed visual prompts.
-            enhance_prompt=False,
         )
         if self.config.get("pipeline_type") == "multi-scale":
             upsampler = hf_hub_download(LTX_REPO, self.config["spatial_upscaler_model_path"])

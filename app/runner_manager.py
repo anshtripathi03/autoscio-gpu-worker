@@ -115,7 +115,10 @@ class RunnerManager:
         try:
             res = await self.http.get(f"http://127.0.0.1:{runner.port}/health", timeout=3.0)
             data = res.json()
-            runner.state = data.get("state", runner.state)
+            state = data.get("state", runner.state)
+            if state != runner.state:
+                log.info("%s runner: %s -> %s", runner.name, runner.state, state)
+            runner.state = state
             runner.error = data.get("error")
         except (httpx.HTTPError, ValueError):
             pass  # still booting, or busy rendering (single-threaded); keep last state

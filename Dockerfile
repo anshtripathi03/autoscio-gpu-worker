@@ -34,11 +34,17 @@ RUN /opt/venv-tts/bin/python -c "from chatterbox.mtl_tts import ChatterboxMultil
 RUN pip install -r requirements/api.txt
 
 COPY app/ app/
+# Import each runner in its own venv (no GPU needed: models load only at runtime),
+# so a broken import fails this build instead of the Pod.
+RUN /opt/venv-tts/bin/python -c "import app.runners.tts_runner" \
+    && /opt/venv-video/bin/python -c "import app.runners.video_runner"
 COPY start.sh /start.sh
 RUN chmod +x /start.sh
 
 ARG GIT_SHA=dev
+# expandable_segments: two model processes share one GPU; this reduces fragmentation.
 ENV GIT_SHA=${GIT_SHA} \
+    PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True \
     MODELS_DIR=/workspace/models \
     WORK_DIR=/tmp/jobs \
     PORT=8000
