@@ -183,7 +183,7 @@ See [.env.example](.env.example). The ones that matter:
 | `WORKER_API_KEY` | — | **Required.** The worker refuses to start without it. |
 | `MODELS_DIR` | `/workspace/models` | Keep on the persistent volume. |
 | `LTX_PIPELINE_CONFIG` | `ltxv-2b-0.9.8-distilled.yaml` | `ltxv-13b-0.9.8-distilled.yaml` = better quality, needs a 48 GB+ GPU (L40S / A6000). |
-| `LTX_OFFLOAD_TO_CPU` | `0` | Set `1` if video jobs hit "GPU ran out of memory". |
+| `LTX_OFFLOAD_TO_CPU` | `1` | Parks the text encoder in CPU RAM during generation; needed on 24 GB GPUs. If videos still hit "GPU ran out of memory", lower `LTX_LONG_EDGE` (e.g. `768`). |
 | `ENABLED_RUNNERS` | `tts,video` | Run just one model on a Pod. |
 
 ---

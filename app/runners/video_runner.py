@@ -133,7 +133,10 @@ class LtxRunner(ModelRunner):
         self.pipeline = pipeline
         stg_mode = self.config.get("stg_mode", "attention_values").lower()
         self.skip_layer_strategy = STG_MODES[stg_mode]
-        self.offload = os.environ.get("LTX_OFFLOAD_TO_CPU", "0") == "1"
+        # On by default: the T5 text encoder (~9.5 GB) is only needed to read the prompt.
+        # LTX moves it back to the GPU at the start of every call and off again after
+        # encoding, which frees the room generation needs next to Chatterbox on 24 GB.
+        self.offload = os.environ.get("LTX_OFFLOAD_TO_CPU", "1") == "1"
         self.fps = env_int("LTX_FPS", 24)
         self.long_edge = env_int("LTX_LONG_EDGE", 960)
         self.max_seconds = env_int("LTX_MAX_SECONDS", 8)

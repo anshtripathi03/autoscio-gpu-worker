@@ -94,7 +94,7 @@ def serve(runner: ModelRunner) -> None:
             except BaseException as err:  # noqa: BLE001
                 traceback.print_exc()
                 message = (
-                    "GPU ran out of memory — try a shorter clip or set LTX_OFFLOAD_TO_CPU=1"
+                    "GPU ran out of memory — try a shorter clip or a lower LTX_LONG_EDGE"
                     if is_oom(err)
                     else f"{type(err).__name__}: {err}"
                 )
