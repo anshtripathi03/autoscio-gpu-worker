@@ -59,6 +59,20 @@ STG_MODES = {
 }
 
 
+class GpuPinnedLTXVideoPipeline(LTXVideoPipeline):
+    """LTXVideoPipeline that always runs on CUDA.
+
+    diffusers derives `_execution_device` from the first registered component, which is
+    the text encoder. With offload_to_cpu the text encoder is parked on the CPU after
+    encoding, so on the next pass LTX concludes it should run on the CPU, moves the
+    transformer there and crashes with "Expected all tensors to be on the same device".
+    """
+
+    @property
+    def _execution_device(self):
+        return torch.device("cuda")
+
+
 def build_pipeline(
     ckpt_path: str,
     precision: str,
@@ -86,7 +100,7 @@ def build_pipeline(
     ).to(device)
     tokenizer = T5Tokenizer.from_pretrained(text_encoder_name, subfolder="tokenizer")
 
-    pipeline = LTXVideoPipeline(
+    pipeline = GpuPinnedLTXVideoPipeline(
         transformer=transformer,
         patchifier=SymmetricPatchifier(patch_size=1),
         text_encoder=text_encoder,
