@@ -10,6 +10,7 @@ Mirrors ltx_video.inference.infer(), with two differences:
 
 from __future__ import annotations
 
+import gc
 import json
 import os
 import random
@@ -153,7 +154,18 @@ class LtxRunner(ModelRunner):
         self.offload = os.environ.get("LTX_OFFLOAD_TO_CPU", "1") == "1"
         self.fps = env_int("LTX_FPS", 24)
         self.long_edge = env_int("LTX_LONG_EDGE", 960)
-        self.max_seconds = env_int("LTX_MAX_SECONDS", 8)
+        # 5 s (121 frames at 544x960) is what fits next to Chatterbox on 24 GB.
+        self.max_seconds = env_int("LTX_MAX_SECONDS", 5)
+
+    def cleanup(self) -> None:
+        gc.collect()
+        # If a run failed between LTX moving T5 to the GPU and offloading it again,
+        # park it back on the CPU so it doesn't eat the next job's headroom.
+        if self.offload:
+            video = getattr(self.pipeline, "video_pipeline", self.pipeline)
+            if getattr(video, "text_encoder", None) is not None:
+                video.text_encoder = video.text_encoder.cpu()
+        torch.cuda.empty_cache()
 
     def run(self, payload: dict) -> dict:
         params = payload["params"]

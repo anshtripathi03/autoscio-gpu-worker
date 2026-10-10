@@ -116,7 +116,7 @@ With no `voiceSampleUrl`, Chatterbox's built-in default voice is used.
 | `prompt` | — | ≤ 2000 chars. Detailed, literal scene descriptions work best. |
 | `negativePrompt` | built-in | |
 | `aspectRatio` | `9:16` | `9:16` (544×960), `16:9` (960×544), `1:1` (704×704) |
-| `durationSeconds` | `5` | Clamped to `LTX_MAX_SECONDS` (default 8) |
+| `durationSeconds` | `5` | Clamped to `LTX_MAX_SECONDS` (default 5; what fits a 24 GB GPU) |
 | `seed` | random | Fix it to reproduce a clip |
 
 ### `GET /jobs/{taskId}` and the webhook body

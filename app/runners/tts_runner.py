@@ -7,6 +7,7 @@ so one tenant's voice can never carry into the next job.
 
 from __future__ import annotations
 
+import gc
 import os
 from pathlib import Path
 
@@ -32,6 +33,10 @@ class ChatterboxRunner(ModelRunner):
         # The repo ships a built-in default voice; used when a job has no sample.
         self.default_conds = self.model.conds
         self.max_chars = env_int("CHATTERBOX_CHUNK_CHARS", 250)
+
+    def cleanup(self) -> None:
+        gc.collect()
+        torch.cuda.empty_cache()
 
     def run(self, payload: dict) -> dict:
         params = payload["params"]

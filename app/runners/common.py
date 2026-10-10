@@ -9,6 +9,7 @@ on 127.0.0.1 only. Requests are handled one at a time, which is what we want on 
 
 from __future__ import annotations
 
+import gc
 import json
 import os
 import re
@@ -36,6 +37,10 @@ class ModelRunner:
 
     def run(self, payload: dict) -> dict:
         raise NotImplementedError
+
+    def cleanup(self) -> None:
+        """Runs after every job, success or failure. Model runners also free GPU cache."""
+        gc.collect()
 
 
 def is_oom(err: BaseException) -> bool:
@@ -99,6 +104,14 @@ def serve(runner: ModelRunner) -> None:
                     else f"{type(err).__name__}: {err}"
                 )
                 self._send(500, {"ok": False, "error": message, "retryable": True})
+            finally:
+                # A failed run's traceback keeps its frames (and their GPU tensors)
+                # alive in a reference cycle until the GC runs. Without this, one OOM
+                # leaves the memory held and every following job fails too.
+                try:
+                    runner.cleanup()
+                except Exception:  # noqa: BLE001
+                    traceback.print_exc()
 
         def log_message(self, *args) -> None:
             pass  # the API process already logs every job
