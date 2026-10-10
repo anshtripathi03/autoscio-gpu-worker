@@ -163,3 +163,50 @@ def test_i2v_downloads_the_image(client, internet):
 def test_unknown_job_is_404(client):
     assert client.get("/jobs/nope", headers=AUTH).status_code == 404
     assert client.delete("/jobs/nope", headers=AUTH).status_code == 404
+
+
+# ── Test mode (Postman, no S3) ───────────────────────────────────────────────
+
+
+def test_upload_then_tts_without_s3_and_download_result(client, internet):
+    up = client.post(
+        "/files",
+        headers=AUTH,
+        files={"file": ("me.m4a", b"fake-voice-bytes", "audio/mp4")},
+    )
+    assert up.status_code == 201
+    file_id = up.json()["fileId"]
+
+    job = tts_job(
+        inputs={"voiceSampleFileId": file_id},
+        output={"contentType": "audio/mpeg"},
+        webhook=None,
+    )
+    assert client.post("/jobs", json=job, headers=AUTH).status_code == 202
+    view = wait_for(client, job["taskId"])
+    assert view["status"] == "COMPLETED", view
+    assert view["result"]["s3Key"] is None
+    assert view["result"]["downloadUrl"] == f"/jobs/{job['taskId']}/output"
+    assert internet.uploads == {}  # nothing went to S3
+
+    res = client.get(view["result"]["downloadUrl"], headers=AUTH)
+    assert res.status_code == 200
+    assert res.content == b"fake-tts"
+    assert res.headers["content-type"].startswith("audio/mpeg")
+
+
+def test_test_mode_requires_auth_and_known_files(client):
+    files = {"file": ("x.wav", b"abc", "audio/wav")}
+    assert client.post("/files", files=files).status_code == 401
+    assert client.get("/jobs/nope/output", headers=AUTH).status_code == 404
+
+    job = tts_job(inputs={"voiceSampleFileId": "0" * 32}, output={"contentType": "audio/mpeg"})
+    client.post("/jobs", json=job, headers=AUTH)
+    view = wait_for(client, job["taskId"])
+    assert view["status"] == "FAILED"
+    assert "Unknown fileId" in view["error"]
+
+
+def test_put_url_still_requires_s3_key(client):
+    job = tts_job(output={"putUrl": "https://s3.test/x?sig=1", "contentType": "audio/mpeg"})
+    assert client.post("/jobs", json=job, headers=AUTH).status_code == 422

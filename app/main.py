@@ -1,9 +1,12 @@
 """Autoscio GPU worker — job API in front of the Chatterbox and LTX-Video runners.
 
-POST   /jobs        submit a job (returns immediately; result arrives by webhook)
-GET    /jobs/{id}   job status (the backend's fallback when a webhook is missed)
-DELETE /jobs/{id}   cancel a job that has not started
-GET    /health      liveness + whether the models are loaded (no auth)
+POST   /jobs              submit a job (returns immediately; result arrives by webhook)
+GET    /jobs/{id}         job status (the backend's fallback when a webhook is missed)
+DELETE /jobs/{id}         cancel a job that has not started
+GET    /health            liveness + whether the models are loaded (no auth)
+Test mode (no S3):
+POST   /files             upload a voice sample / image, returns a fileId
+GET    /jobs/{id}/output  download a result that was not sent to S3
 """
 
 from __future__ import annotations
@@ -14,7 +17,8 @@ import logging
 from contextlib import asynccontextmanager
 from typing import Optional
 
-from fastapi import Depends, FastAPI, Header, HTTPException, Request, Response
+from fastapi import Depends, FastAPI, File, Header, HTTPException, Request, Response, UploadFile
+from fastapi.responses import FileResponse
 from pydantic import ValidationError
 
 from . import transfer
@@ -88,8 +92,8 @@ async def submit_job(body: JobRequest, request: Request, response: Response) -> 
         PARAMS_MODEL[body.kind].model_validate(body.params)
     except ValidationError as err:
         raise HTTPException(422, f"Invalid params for {body.kind}: {err.errors()}") from err
-    if body.kind == "i2v" and not body.inputs.imageUrl:
-        raise HTTPException(422, "i2v jobs need inputs.imageUrl")
+    if body.kind == "i2v" and not (body.inputs.imageUrl or body.inputs.imageFileId):
+        raise HTTPException(422, "i2v jobs need inputs.imageUrl or inputs.imageFileId")
 
     jobs: JobService = request.app.state.jobs
     try:
@@ -101,6 +105,31 @@ async def submit_job(body: JobRequest, request: Request, response: Response) -> 
     view = job.view()
     view["queuePosition"] = jobs.queue_depth() if created else None
     return view
+
+
+@app.post("/files", status_code=201, dependencies=[Depends(require_auth)])
+async def upload_file(request: Request, file: UploadFile = File(...)) -> dict:
+    """Test mode: store an input on the worker and get a fileId for inputs.*FileId."""
+    limit = request.app.state.settings.max_input_bytes
+    data = await file.read(limit + 1)
+    if len(data) > limit:
+        raise HTTPException(413, f"File is larger than {limit // (1024 * 1024)} MB")
+    if not data:
+        raise HTTPException(422, "File is empty")
+    jobs: JobService = request.app.state.jobs
+    file_id = jobs.save_upload(file.filename or "", file.content_type or "", data)
+    return {"fileId": file_id, "bytes": len(data)}
+
+
+@app.get("/jobs/{job_id}/output", dependencies=[Depends(require_auth)])
+async def job_output(job_id: str, request: Request) -> FileResponse:
+    """Test mode: the result of a job submitted without output.putUrl."""
+    jobs: JobService = request.app.state.jobs
+    job = jobs.get(job_id)
+    path = jobs.result_file(job_id)
+    if job is None or path is None or not job.result:
+        raise HTTPException(404, "No stored output for this job (not finished, or sent to S3)")
+    return FileResponse(path, media_type=job.result["contentType"], filename=path.name)
 
 
 @app.get("/jobs/{job_id}", dependencies=[Depends(require_auth)])

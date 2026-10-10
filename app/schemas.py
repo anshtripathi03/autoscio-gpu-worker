@@ -2,13 +2,17 @@
 
 Every file moves through S3 presigned URLs — the backend never sends media bytes
 in a request body and this worker never returns them in a response.
+
+Test mode (Postman / curl, no S3): upload inputs with POST /files and reference them by
+`fileId`; omit `output.putUrl` and the result stays on the worker, downloadable from
+GET /jobs/{taskId}/output until the job expires.
 """
 
 from __future__ import annotations
 
 from typing import Literal, Optional
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, model_validator
 
 JobKind = Literal["tts", "t2v", "i2v"]
 
@@ -24,16 +28,26 @@ class JobInputs(BaseModel):
     # Presigned S3 GET URLs. Short-lived; downloaded once when the job starts.
     voiceSampleUrl: Optional[str] = None
     imageUrl: Optional[str] = None
+    # Test mode: ids returned by POST /files.
+    voiceSampleFileId: Optional[str] = Field(default=None, pattern=r"^[a-f0-9]{32}$")
+    imageFileId: Optional[str] = Field(default=None, pattern=r"^[a-f0-9]{32}$")
 
 
 class JobOutput(BaseModel):
     # Presigned S3 PUT URL the result is uploaded to. Must still be valid when the
-    # job FINISHES (queue wait + render), so mint it with a long expiry (~2h).
-    putUrl: str = Field(min_length=1)
-    s3Key: str = Field(min_length=1, max_length=1024)
+    # job FINISHES (queue wait + render). Omit it (test mode) to keep the result on
+    # the worker and download it from GET /jobs/{taskId}/output.
+    putUrl: Optional[str] = Field(default=None, min_length=1)
+    s3Key: Optional[str] = Field(default=None, min_length=1, max_length=1024)
     contentType: str
     # Any extra headers the presigned PUT was signed with (e.g. SSE).
     headers: dict[str, str] = Field(default_factory=dict)
+
+    @model_validator(mode="after")
+    def _s3_key_with_put_url(self) -> JobOutput:
+        if self.putUrl and not self.s3Key:
+            raise ValueError("output.s3Key is required when output.putUrl is set")
+        return self
 
 
 class WebhookSpec(BaseModel):
