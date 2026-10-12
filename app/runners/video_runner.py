@@ -31,6 +31,7 @@ from ltx_video.models.transformers.symmetric_patchifier import SymmetricPatchifi
 from ltx_video.pipelines.pipeline_ltx_video import LTXMultiScalePipeline, LTXVideoPipeline
 from ltx_video.schedulers.rf import RectifiedFlowScheduler
 from ltx_video.utils.skip_layer_strategy import SkipLayerStrategy
+from PIL import Image, ImageOps
 from safetensors import safe_open
 from transformers import T5EncoderModel, T5Tokenizer
 
@@ -58,6 +59,22 @@ STG_MODES = {
     "transformer_block": SkipLayerStrategy.TransformerBlock,
     "stg_t": SkipLayerStrategy.TransformerBlock,
 }
+
+
+def fit_image(path: str, width: int, height: int) -> str:
+    """Centre-crop ("cover") and resize an image to exactly width x height; returns the new path.
+
+    Honours EXIF rotation (phone photos) and drops alpha so LTX gets plain RGB.
+    """
+    try:
+        with Image.open(path) as img:
+            img = ImageOps.exif_transpose(img).convert("RGB")
+            fitted = ImageOps.fit(img, (width, height), method=Image.Resampling.LANCZOS)
+    except Exception as err:  # noqa: BLE001
+        raise UserError(f"Could not read the scene image: {err}") from err
+    out = str(Path(path).with_name("fitted.png"))
+    fitted.save(out)
+    return out
 
 
 class GpuPinnedLTXVideoPipeline(LTXVideoPipeline):
@@ -185,6 +202,10 @@ class LtxRunner(ModelRunner):
         conditioning = None
         image = payload.get("inputs", {}).get("imagePath")
         if image:
+            # LTX's image loader (just_crop=True) crops to the aspect ratio but never
+            # resizes, so a 1080x1920 photo would not match the 544x960 latent. Fit it
+            # to the exact frame first.
+            image = fit_image(image, width, height)
             conditioning = prepare_conditioning(
                 conditioning_media_paths=[image],
                 conditioning_strengths=[1.0],
