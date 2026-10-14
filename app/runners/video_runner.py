@@ -14,6 +14,7 @@ import gc
 import json
 import os
 import random
+import threading
 from pathlib import Path
 
 import imageio
@@ -163,26 +164,84 @@ class LtxRunner(ModelRunner):
                 pipeline, latent_upsampler=create_latent_upsampler(upsampler, pipeline.device)
             )
         self.pipeline = pipeline
+        # The single-scale pipeline that owns the text encoder and transformer.
+        self.video_pipe = getattr(pipeline, "video_pipeline", pipeline)
         stg_mode = self.config.get("stg_mode", "attention_values").lower()
         self.skip_layer_strategy = STG_MODES[stg_mode]
-        # On by default: the T5 text encoder (~9.5 GB) is only needed to read the prompt.
-        # LTX moves it back to the GPU at the start of every call and off again after
-        # encoding, which frees the room generation needs next to Chatterbox on 24 GB.
+        # On by default: the T5 text encoder (~9.5 GB) only reads the prompt. It lives
+        # in CPU RAM and visits the GPU alone, once per clip, before generation starts.
         self.offload = os.environ.get("LTX_OFFLOAD_TO_CPU", "1") == "1"
         self.fps = env_int("LTX_FPS", 24)
         self.long_edge = env_int("LTX_LONG_EDGE", 960)
         # 5 s (121 frames at 544x960) is what fits next to Chatterbox on 24 GB.
         self.max_seconds = env_int("LTX_MAX_SECONDS", 5)
+        # If GPU memory still held after cleanup grows this far past the idle baseline,
+        # something is leaking: the runner restarts itself before the next job fails.
+        self.leak_limit = env_int("LTX_LEAK_LIMIT_MB", 2048) * 1024 * 1024
+
+        self._park_text_encoder()
+        gc.collect()
+        torch.cuda.empty_cache()
+        self.baseline = torch.cuda.memory_allocated()
+        print(f"[video] idle GPU memory: {self._mem()}", flush=True)
+
+    def _mem(self) -> str:
+        gib = 1024**3
+        return (
+            f"allocated {torch.cuda.memory_allocated() / gib:.2f} GiB, "
+            f"reserved {torch.cuda.memory_reserved() / gib:.2f} GiB"
+        )
+
+    def _park_text_encoder(self) -> None:
+        if self.offload and getattr(self.video_pipe, "text_encoder", None) is not None:
+            self.video_pipe.text_encoder = self.video_pipe.text_encoder.cpu()
 
     def cleanup(self) -> None:
+        # A failed run's traceback keeps its GPU tensors alive until the GC runs, and a
+        # run that died mid-encode may have left T5 on the GPU: undo both.
         gc.collect()
-        # If a run failed between LTX moving T5 to the GPU and offloading it again,
-        # park it back on the CPU so it doesn't eat the next job's headroom.
-        if self.offload:
-            video = getattr(self.pipeline, "video_pipeline", self.pipeline)
-            if getattr(video, "text_encoder", None) is not None:
-                video.text_encoder = video.text_encoder.cpu()
+        self._park_text_encoder()
         torch.cuda.empty_cache()
+        held = torch.cuda.memory_allocated()
+        print(f"[video] after job: {self._mem()}", flush=True)
+        if held - self.baseline > self.leak_limit:
+            # The job's response has already been sent; a fresh process (the worker
+            # restarts it automatically) is the only reliable way to get memory back.
+            print(
+                f"[video] {(held - self.baseline) / 1024**3:.2f} GiB still held after "
+                "cleanup — restarting the video runner to free it",
+                flush=True,
+            )
+            threading.Timer(1.0, os._exit, (3,)).start()
+
+    def _encode(self, prompt: str, negative: str) -> dict:
+        """Prompt -> T5 embeddings, with T5 the only thing that moves onto the GPU.
+
+        LTX would otherwise move T5 onto the GPU at the start of EVERY pass (twice per
+        multi-scale clip) next to whatever generation still holds, which is where 24 GB
+        cards run out of memory.
+        """
+        video = self.video_pipe
+        if self.offload:
+            video.text_encoder = video.text_encoder.to(self.device)
+        try:
+            with torch.no_grad():
+                embeds, mask, neg_embeds, neg_mask = video.encode_prompt(
+                    prompt,
+                    True,
+                    negative_prompt=negative,
+                    device=self.device,
+                    text_encoder_max_tokens=256,
+                )
+        finally:
+            self._park_text_encoder()
+            torch.cuda.empty_cache()
+        return {
+            "prompt_embeds": embeds,
+            "prompt_attention_mask": mask,
+            "negative_prompt_embeds": neg_embeds,
+            "negative_prompt_attention_mask": neg_mask,
+        }
 
     def run(self, payload: dict) -> dict:
         params = payload["params"]
@@ -199,55 +258,36 @@ class LtxRunner(ModelRunner):
         width, height = video_dimensions(aspect, self.long_edge)
         num_frames = frames_for_duration(seconds, self.fps)
 
-        conditioning = None
         image = payload.get("inputs", {}).get("imagePath")
         if image:
             # LTX's image loader (just_crop=True) crops to the aspect ratio but never
             # resizes, so a 1080x1920 photo would not match the 544x960 latent. Fit it
             # to the exact frame first.
             image = fit_image(image, width, height)
-            conditioning = prepare_conditioning(
-                conditioning_media_paths=[image],
-                conditioning_strengths=[1.0],
-                conditioning_start_frames=[0],
-                height=height,
-                width=width,
-                num_frames=num_frames,
-                padding=(0, 0, 0, 0),  # dimensions are already multiples of 32
-                pipeline=self.pipeline,
-            )
 
-        call_config = {k: v for k, v in self.config.items() if k != "stg_mode"}
-        generator = torch.Generator(device=self.device).manual_seed(seed)
-        try:
-            images = self.pipeline(
-                **call_config,
-                skip_layer_strategy=self.skip_layer_strategy,
-                generator=generator,
-                output_type="pt",
-                callback_on_step_end=None,
-                height=height,
-                width=width,
-                num_frames=num_frames,
-                frame_rate=self.fps,
-                prompt=prompt,
-                prompt_attention_mask=None,
-                negative_prompt=params.get("negativePrompt") or DEFAULT_NEGATIVE,
-                negative_prompt_attention_mask=None,
-                media_items=None,
-                conditioning_items=conditioning,
-                is_video=True,
-                vae_per_channel_normalize=True,
-                image_cond_noise_scale=0.15,
-                mixed_precision=self.config["precision"] == "mixed_precision",
-                offload_to_cpu=self.offload,
-                device=self.device,
-                enhance_prompt=False,
-            ).images
-
-            frames = images[0][:, :num_frames].permute(1, 2, 3, 0).cpu().float().numpy()
-            frames = (np.clip(frames, 0.0, 1.0) * 255).astype(np.uint8)
-        finally:
+        # Start from a clean GPU, then retry once after freeing memory if it runs out.
+        gc.collect()
+        torch.cuda.empty_cache()
+        print(f"[video] before job: {self._mem()}", flush=True)
+        for attempt in (1, 2):
+            try:
+                frames = self._generate(
+                    prompt,
+                    params.get("negativePrompt") or DEFAULT_NEGATIVE,
+                    image,
+                    width,
+                    height,
+                    num_frames,
+                    seed,
+                )
+                break
+            except torch.OutOfMemoryError:
+                if attempt == 2:
+                    raise
+                print("[video] GPU out of memory — freeing memory and retrying once", flush=True)
+            # Outside the except block, so the failed attempt's frames are released.
+            self._park_text_encoder()
+            gc.collect()
             torch.cuda.empty_cache()
 
         with imageio.get_writer(
@@ -269,6 +309,70 @@ class LtxRunner(ModelRunner):
             "fps": self.fps,
             "seed": seed,
         }
+
+    def _generate(
+        self,
+        prompt: str,
+        negative: str,
+        image: str | None,
+        width: int,
+        height: int,
+        num_frames: int,
+        seed: int,
+    ) -> np.ndarray:
+        embeds = self._encode(prompt, negative)
+        conditioning = None
+        if image:
+            conditioning = prepare_conditioning(
+                conditioning_media_paths=[image],
+                conditioning_strengths=[1.0],
+                conditioning_start_frames=[0],
+                height=height,
+                width=width,
+                num_frames=num_frames,
+                padding=(0, 0, 0, 0),  # dimensions are already multiples of 32
+                pipeline=self.pipeline,
+            )
+
+        call_config = {k: v for k, v in self.config.items() if k != "stg_mode"}
+        generator = torch.Generator(device=self.device).manual_seed(seed)
+        video = self.video_pipe
+        text_encoder = video.text_encoder
+        # With the embeddings supplied and no text encoder, LTX skips T5 entirely, so
+        # generation never shares the GPU with it and the transformer can stay put.
+        video.text_encoder = None
+        try:
+            images = self.pipeline(
+                **call_config,
+                **embeds,
+                skip_layer_strategy=self.skip_layer_strategy,
+                generator=generator,
+                output_type="pt",
+                callback_on_step_end=None,
+                height=height,
+                width=width,
+                num_frames=num_frames,
+                frame_rate=self.fps,
+                # LTX refuses text together with embeddings; the embeddings carry it.
+                prompt=None,
+                negative_prompt=None,
+                media_items=None,
+                conditioning_items=conditioning,
+                is_video=True,
+                vae_per_channel_normalize=True,
+                image_cond_noise_scale=0.15,
+                mixed_precision=self.config["precision"] == "mixed_precision",
+                offload_to_cpu=False,
+                device=self.device,
+                enhance_prompt=False,
+            ).images
+            frames = images[0][:, :num_frames].permute(1, 2, 3, 0).cpu().float().numpy()
+            del images
+            return (np.clip(frames, 0.0, 1.0) * 255).astype(np.uint8)
+        finally:
+            video.text_encoder = text_encoder
+            del embeds, conditioning
+            torch.cuda.empty_cache()
 
 
 if __name__ == "__main__":

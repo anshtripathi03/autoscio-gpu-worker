@@ -183,7 +183,8 @@ See [.env.example](.env.example). The ones that matter:
 | `WORKER_API_KEY` | — | **Required.** The worker refuses to start without it. |
 | `MODELS_DIR` | `/workspace/models` | Keep on the persistent volume. |
 | `LTX_PIPELINE_CONFIG` | `ltxv-2b-0.9.8-distilled.yaml` | `ltxv-13b-0.9.8-distilled.yaml` = better quality, needs a 48 GB+ GPU (L40S / A6000). |
-| `LTX_OFFLOAD_TO_CPU` | `1` | Parks the text encoder in CPU RAM during generation; needed on 24 GB GPUs. If videos still hit "GPU ran out of memory", lower `LTX_LONG_EDGE` (e.g. `768`). |
+| `LTX_OFFLOAD_TO_CPU` | `1` | Keeps the T5 text encoder in CPU RAM. Each clip moves it onto the GPU alone to read the prompt, then back, before generation starts — so it never shares the GPU with generation. Needed on 24 GB GPUs. |
+| `LTX_LEAK_LIMIT_MB` | `2048` | If GPU memory still held after a job's cleanup exceeds the idle baseline by this much, the video runner restarts itself (the worker relaunches it) instead of letting the next job run out of memory. |
 | `ENABLED_RUNNERS` | `tts,video` | Run just one model on a Pod. |
 
 ---
