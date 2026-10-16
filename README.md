@@ -64,8 +64,20 @@ GPU_WORKER_API_KEY=<the same secret as WORKER_API_KEY>
 | Stop paying for the GPU | RunPod → Pod → **Stop**. Weights stay on the volume (~$0.20/GB/month while stopped). |
 | Start again | **Start**. Ready in ~1–3 min, with no re-download. |
 | Start fails ("no GPU available") | Deploy a **new** Pod (button or console). It re-downloads the weights (10–20 min). Update `GPU_WORKER_URL` in the backend, then **Terminate** the old Pod. |
-| Ship new worker code | Push to `main` → CI builds `:latest` → deploy a new Pod (the image is pulled at Pod creation) → update `GPU_WORKER_URL` → terminate the old Pod. |
+| Ship new worker code | Push to `main` → CI builds `:latest` → RunPod → your Pod → **Edit** → **Save**. The container is recreated and the image re-pulled. The Pod keeps its id, so **`GPU_WORKER_URL` does not change** and the backend needs no edit. Then check the version (next row). |
+| Check which build is actually running | `curl -s "$GPU_WORKER_URL/health" \| jq '{version, ready}'` — `version` is the commit SHA CI baked into the image. |
+| Edit → Save did not pick up the new build | `version` still shows the old SHA. Deploy a **new** Pod from `:latest` (or from the exact `sha-xxxxxxx` tag), update `GPU_WORKER_URL`, terminate the old Pod. |
 | Done for now | **Terminate** the Pod (deletes the volume too; next deploy re-downloads). |
+
+**Prefer Edit → Save over deploying a new Pod.** A new Pod gets a new id, so its URL changes and the
+backend's `GPU_WORKER_URL` must be updated and the backend restarted. Miss that and nothing fails
+loudly — `AdRendererService` catches the unreachable worker and silently falls back to Standard
+(zoom/pan) motion, so Cinematic renders quietly stop using the GPU. Edit → Save avoids the whole
+problem by keeping the id.
+
+**Always confirm the version after shipping.** `:latest` is a moving tag: nothing on the Pod page
+tells you which build is loaded, and a stale container looks identical to a fresh one. `/health`
+needs no auth, so the check is one curl.
 
 On demo days, start the Pod an hour early and leave it running. Don't swap Pods minutes before a presentation.
 
