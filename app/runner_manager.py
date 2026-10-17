@@ -26,6 +26,7 @@ log = logging.getLogger("worker.runners")
 APP_ROOT = Path(__file__).resolve().parent.parent
 RUNNER_FOR_KIND = {"tts": "tts", "t2v": "video", "i2v": "video"}
 HEALTH_INTERVAL_S = 5
+READY_POLL_S = 1.0
 MAX_BACKOFF_S = 120
 
 
@@ -130,10 +131,7 @@ class RunnerManager:
             raise JobFailure(f"The {name} model is not enabled on this worker", retryable=False)
         if self.fake:
             return _fake_run(kind, payload)
-        if runner.state != "ready":
-            raise JobFailure(
-                f"The {name} model is not ready yet (state: {runner.state})", retryable=True
-            )
+        await self._wait_until_ready(runner)
         try:
             res = await self.http.post(
                 f"http://127.0.0.1:{runner.port}/run",
@@ -157,6 +155,28 @@ class RunnerManager:
                 retryable=bool(data.get("retryable", res.status_code >= 500)),
             )
         return data
+
+    async def _wait_until_ready(self, runner: Runner) -> None:
+        """Hold the job while the runner (re)loads instead of failing it.
+
+        The video runner exits on purpose after a job that leaked GPU memory, and the
+        supervisor reloads it. Failing every queued job during that minute or two
+        turned one restart into a whole video of un-animated scenes.
+        """
+        if runner.state == "ready":
+            return
+        log.info("Waiting for the %s runner (state: %s)", runner.name, runner.state)
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + self.settings.runner_ready_wait_s
+        while runner.state != "ready":
+            if loop.time() >= deadline:
+                raise JobFailure(
+                    f"The {runner.name} model is not ready yet (state: {runner.state}"
+                    f"{f', {runner.error}' if runner.error else ''}) after waiting "
+                    f"{self.settings.runner_ready_wait_s}s",
+                    retryable=True,
+                )
+            await asyncio.sleep(READY_POLL_S)
 
 
 def _fake_run(kind: str, payload: dict) -> dict:
