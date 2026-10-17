@@ -34,6 +34,7 @@ class Settings:
     tts_port: int
     video_port: int
     runner_timeout_s: int
+    runner_ready_wait_s: int
     max_input_bytes: int
     max_queue: int
     job_ttl_s: int
@@ -57,6 +58,9 @@ def load_settings() -> Settings:
         tts_port=_int("TTS_RUNNER_PORT", 8101),
         video_port=_int("VIDEO_RUNNER_PORT", 8102),
         runner_timeout_s=_int("RUNNER_TIMEOUT_SECONDS", 1800),
+        # How long a job waits for its model to (re)load before failing. The video
+        # runner restarts itself after a leak and takes a minute or two to reload.
+        runner_ready_wait_s=_int("RUNNER_READY_WAIT_SECONDS", 600),
         max_input_bytes=_int("MAX_INPUT_BYTES", 25 * 1024 * 1024),
         max_queue=_int("MAX_QUEUE", 100),
         job_ttl_s=_int("JOB_TTL_SECONDS", 24 * 3600),
